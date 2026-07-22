@@ -35,6 +35,8 @@ export interface PdfEngine {
   open(buffer: ArrayBuffer): Promise<void>
   getPageCount(): number
   getPage(num: number): Promise<PageRenderResult>
+  /** 获取单页原始尺寸（scale=1），不触发渲染 */
+  getPageDimension(num: number): Promise<PageDimension>
   /** 批量获取所有页面的原始尺寸（scale=1），用于占位高度与虚拟化，不触发渲染 */
   getPageDimensions(): Promise<PageDimension[]>
   getOutline(): Promise<OutlineItem[]>

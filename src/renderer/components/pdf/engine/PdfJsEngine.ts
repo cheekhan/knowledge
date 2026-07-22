@@ -37,6 +37,14 @@ export class PdfJsEngine implements PdfEngine {
     }
   }
 
+  /** 获取单页原始尺寸（scale=1），用于懒加载；不触发渲染 */
+  async getPageDimension(num: number): Promise<PageDimension> {
+    if (!this.doc) throw new Error('Engine not opened')
+    const page = await this.doc.getPage(num)
+    const vp = page.getViewport({ scale: 1 })
+    return { width: vp.width, height: vp.height }
+  }
+
   async getPageDimensions(): Promise<PageDimension[]> {
     if (!this.doc) return []
     const dims: PageDimension[] = []
@@ -52,17 +60,45 @@ export class PdfJsEngine implements PdfEngine {
     if (!this.doc) return []
     try {
       const out = await this.doc.getOutline()
-      return out ? out.map(conv) : []
+      if (!out) return []
+      return Promise.all(out.map((item) => this.resolveOutlineItem(item)))
     } catch { return [] }
   }
 
-  close(): void { this.doc?.cleanup(); this.doc = null }
-}
+  /** 递归解析 Outline 节点，正确解析 dest → page number */
+  private async resolveOutlineItem(item: unknown): Promise<OutlineItem> {
+    const node = item as Record<string, unknown>
+    let page = 1
 
-function conv(n: Record<string, unknown>): OutlineItem {
-  return {
-    title: (n.title as string) || '',
-    page: typeof n.dest === 'number' ? n.dest as number : 1,
-    children: (n.items as Record<string, unknown>[] | undefined)?.map(conv)
+    if (node.dest) {
+      let dest: unknown = node.dest
+      // pdfjs dest 可能是 string（命名目标）或数组 [pageRef, ...]
+      if (typeof dest === 'string') {
+        try {
+          dest = await this.doc!.getDestination(dest)
+        } catch { dest = null }
+      }
+      if (Array.isArray(dest) && dest.length > 0) {
+        const pageRef = dest[0]
+        try {
+          // getPageIndex 返回 0-based index
+          page = (await this.doc!.getPageIndex(pageRef)) + 1
+        } catch { /* keep page=1 */ }
+      }
+    }
+
+    const children = node.items
+      ? await Promise.all(
+        (node.items as unknown[]).map((c) => this.resolveOutlineItem(c))
+      )
+      : undefined
+
+    return {
+      title: (node.title as string) || '未命名',
+      page,
+      children
+    }
   }
+
+  close(): void { this.doc?.cleanup(); this.doc = null }
 }

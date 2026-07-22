@@ -39,7 +39,7 @@ const CREATE_PDFS = `
 CREATE TABLE IF NOT EXISTS pdfs (
   path TEXT PRIMARY KEY,
   name TEXT,
-  tags TEXT,
+  bookmarks TEXT,
   mtime INTEGER
 )`
 
@@ -141,22 +141,22 @@ export class IndexService {
     const metaPath = absPath + SIDECAR_SUFFIX
 
     const name = path.basename(relPath)
-    let tags = '[]'
+    let bookmarks = '[]'
     let mtime = 0
 
     try {
       mtime = fs.statSync(absPath).mtimeMs
       if (fs.existsSync(metaPath)) {
         const meta = JSON.parse(fs.readFileSync(metaPath, 'utf-8'))
-        tags = JSON.stringify(meta.tags ?? [])
+        bookmarks = JSON.stringify(meta.bookmarks ?? meta.tags ?? [])
       }
     } catch {
       // 读不到就跳过
     }
 
     db.prepare(
-      'INSERT OR REPLACE INTO pdfs (path, name, tags, mtime) VALUES (?, ?, ?, ?)'
-    ).run(relPath, name, tags, mtime)
+      'INSERT OR REPLACE INTO pdfs (path, name, bookmarks, mtime) VALUES (?, ?, ?, ?)'
+    ).run(relPath, name, bookmarks, mtime)
 
     // P-13: 提取 PDF 文本索引入 pdfs_fts
     const text = extractText(this.vaultRoot, relPath)
@@ -247,15 +247,7 @@ export class IndexService {
 
     // ── PDF 搜索 ──
     if (scope === 'all' || scope === 'pdfs') {
-      if (opts.tag) {
-        // 按标签筛选
-        const rows = db
-          .prepare('SELECT path, name FROM pdfs WHERE tags LIKE ? LIMIT ?')
-          .all(`%"${opts.tag}"%`, limit) as { path: string; name: string }[]
-        for (const row of rows) {
-          results.push({ title: path.basename(row.name, '.pdf'), path: row.path, kind: 'pdf' })
-        }
-      } else if (q.trim()) {
+      if (q.trim()) {
         // 优先 FTS 文本搜索，回退文件名 LIKE
         try {
           const ftsRows = db

@@ -122,7 +122,7 @@ describe('VaultService', () => {
         JSON.stringify({
           version: 2,
           file: 'book.pdf',
-          tags: [],
+          bookmarks: [],
           lastPage: 0,
           boundNotes: ['notes/book-笔记.md'],
           annotations: [],
@@ -158,7 +158,7 @@ describe('VaultService', () => {
         JSON.stringify({
           version: 2,
           file: 'book.pdf',
-          tags: [],
+          bookmarks: [],
           lastPage: 0,
           boundNotes: ['notes/ghost.md'],
           annotations: [],

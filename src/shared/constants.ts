@@ -20,8 +20,8 @@ export const ASSETS_DIR = 'assets'
 /** PDF sidecar 元数据文件后缀 */
 export const SIDECAR_SUFFIX = '.meta.json'
 
-/** 当前 sidecar schema 版本号（需求 4.2 约定 version:2） */
-export const META_VERSION = 2
+/** 当前 sidecar schema 版本号（v3：bookmarks 替代 tags） */
+export const META_VERSION = 3
 
 /** 原子写入时使用的临时文件后缀 */
 export const TMP_SUFFIX = '.tmp'
@@ -59,6 +59,15 @@ export const SCALE_MAX = 4.0
 /** PDF 页面 canvas 缓存 LRU 上限（页数） */
 export const PDF_CACHE_CAPACITY = 50
 
+/** PDF 页面尺寸并发获取上限（避免打开大 PDF 时瞬间大量 IPC） */
+export const PDF_DIM_FETCH_CONCURRENCY = 4
+
+/** 虚拟化视口上下各多渲染的缓冲页数 */
+export const PDF_VISIBLE_BUFFER = 2
+
+/** 单页 canvas 像素上限（16 megapixels），超出自动降低 devicePixelRatio */
+export const PDF_MAX_CANVAS_PIXELS = 16_000_000
+
 /** 自动保存防抖毫秒 */
 export const AUTO_SAVE_DEBOUNCE_MS = 1000
 
@@ -89,7 +98,7 @@ export const IPC_CHANNELS = {
   PDF_READ_BUFFER: 'pdf:readBuffer',
   PDF_GET_META: 'pdf:getMeta',
   PDF_UPDATE_META: 'pdf:updateMeta',
-  PDF_LIST_BY_TAG: 'pdf:listByTag',
+  // pdf:listByTag 已删除（O-02：tags → bookmarks）
   // binding
   BINDING_CREATE: 'binding:createBoundNote',
   BINDING_UNBIND: 'binding:unbind',

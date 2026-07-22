@@ -1,7 +1,14 @@
 {
-  "version": 2,
+  "version": 3,
   "file": "example.pdf",
-  "tags": ["示例", "入门"],
+  "bookmarks": [
+    {
+      "id": "b1",
+      "title": "欢迎页",
+      "page": 1,
+      "createdAt": "2026-07-22T00:00:00Z"
+    }
+  ],
   "lastPage": 1,
   "boundNotes": [
     "pdfs/example/《example》笔记 1.md"

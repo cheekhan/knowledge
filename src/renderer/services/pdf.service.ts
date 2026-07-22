@@ -15,9 +15,5 @@ export const pdfService = {
 
   async updateMeta(relPath: string, patch: Partial<PdfMeta>): Promise<void> {
     await window.api.pdf.updateMeta(relPath, patch)
-  },
-
-  async listByTag(tag: string): Promise<string[]> {
-    return window.api.pdf.listByTag(tag)
   }
 } as const

@@ -14,7 +14,6 @@ export function registerPdfIpc(
 ): void {
   ipcMain.handle('pdf:readBuffer', async (_event, relPath: string) => {
     const buf = fsService.readBuffer(relPath)
-    // 返回 ArrayBuffer 给渲染进程
     return buf.buffer.slice(
       buf.byteOffset,
       buf.byteOffset + buf.byteLength
@@ -31,9 +30,4 @@ export function registerPdfIpc(
       metaService.update(relPath, patch)
     }
   )
-
-  ipcMain.handle('pdf:listByTag', async (_event, _tag: string) => {
-    // 全量扫 sidecar → 返回匹配 PDF 路径
-    return [] // P-09 根据需要实现
-  })
 }

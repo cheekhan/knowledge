@@ -28,23 +28,24 @@ describe('MetadataService', () => {
 
   it('无 sidecar 时返回空元数据', () => {
     const meta = metaService.read('pdfs/book.pdf')
-    expect(meta.version).toBe(2)
-    expect(meta.tags).toEqual([])
+    expect(meta.version).toBe(3)
+    expect(meta.bookmarks).toEqual([])
     expect(meta.boundNotes).toEqual([])
     expect(meta.annotations).toEqual([])
   })
 
-  it('读写 tags', () => {
-    metaService.update('pdfs/book.pdf', { tags: ['计算机', '经典'] })
+  it('读写 bookmarks', () => {
+    metaService.update('pdfs/book.pdf', { bookmarks: [{ id: 'b1', title: '第一章', page: 5, createdAt: new Date().toISOString() }] })
     const meta = metaService.read('pdfs/book.pdf')
-    expect(meta.tags).toEqual(['计算机', '经典'])
+    expect(meta.bookmarks).toHaveLength(1)
+    expect(meta.bookmarks[0].title).toBe('第一章')
   })
 
   it('update 为增量合并', () => {
-    metaService.update('pdfs/book.pdf', { tags: ['tag1'] })
+    metaService.update('pdfs/book.pdf', { bookmarks: [{ id: 'b1', title: '第一章', page: 5, createdAt: new Date().toISOString() }] })
     metaService.update('pdfs/book.pdf', { lastPage: 42 })
     const meta = metaService.read('pdfs/book.pdf')
-    expect(meta.tags).toEqual(['tag1'])
+    expect(meta.bookmarks).toHaveLength(1)
     expect(meta.lastPage).toBe(42)
   })
 
@@ -89,7 +90,7 @@ describe('MetadataService', () => {
 
     const meta = metaService.read('pdfs/bad.pdf')
     expect(meta).toBeDefined()
-    expect(meta.tags).toEqual([])
+    expect(meta.bookmarks).toEqual([])
 
     // 检查原文件被备份
     const entries = fs.readdirSync(path.join(vaultRoot, 'pdfs'))

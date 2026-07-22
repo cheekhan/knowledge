@@ -47,6 +47,18 @@ export interface Annotation {
   createdAt: string
 }
 
+/** PDF 书签（用户手动添加的页级导航点） */
+export interface PdfBookmark {
+  /** 唯一 ID（crypto.randomUUID()） */
+  id: string
+  /** 书签标题 */
+  title: string
+  /** 所在页码（1-based） */
+  page: number
+  /** 创建时间 ISO 8601 */
+  createdAt: string
+}
+
 // ============================================================
 // PDF sidecar 元数据
 // ============================================================
@@ -57,8 +69,8 @@ export interface PdfMeta {
   version: number
   /** PDF 文件名（仅展示用） */
   file: string
-  /** 文件级标签 */
-  tags: string[]
+  /** 用户手动添加的页级书签 */
+  bookmarks: PdfBookmark[]
   /** 上次阅读页（从 1 起，0 = 未读过） */
   lastPage: number
   /** 绑定的笔记相对路径列表（一对多，库内相对路径） */
@@ -72,9 +84,9 @@ export interface PdfMeta {
 /** 创建空元数据（用于无 sidecar 时的默认值） */
 export function createDefaultMeta(fileName: string): PdfMeta {
   return {
-    version: 2,
+    version: 3,
     file: fileName,
-    tags: [],
+    bookmarks: [],
     lastPage: 0,
     boundNotes: [],
     annotations: [],
@@ -168,8 +180,6 @@ export type SearchScope = 'notes' | 'pdfs' | 'all'
 export interface SearchOptions {
   /** 搜索范围 */
   scope?: SearchScope
-  /** 按标签筛选（仅 scope 含 pdfs 时生效） */
-  tag?: string
   /** 最多返回条数 */
   limit?: number
 }

@@ -1,14 +1,13 @@
 /**
- * 虚拟化页面渲染 Hook — P-08 架构 5.3 要求
+ * 虚拟化页面渲染 Hook（重写为 scrollTop 驱动） — O-01.3
  *
- * 使用 IntersectionObserver 计算当前可见页范围，只渲染视口 ±buffer 页，
- * 配合 PageCache(LRU 50) 保证 300 页 PDF 内存 < 800MB。
+ * 不再依赖 IntersectionObserver 和已挂载的 page DOM，
+ * 纯基于 scrollTop + 页面估算/实际高度计算可见范围，
+ * 确保只挂载可见范围内的页面 DOM。
  */
 
-import { useEffect, useRef, useState, useCallback } from 'react'
-
-/** 视口上下各多渲染的缓冲页数 */
-const BUFFER_PAGES = 2
+import { useState, useCallback, useRef, useEffect } from 'react'
+import { PDF_VISIBLE_BUFFER } from '../../../shared/constants'
 
 export interface VirtualRange {
   /** 第一个需要渲染的页码（1-based），inclusive */
@@ -20,146 +19,108 @@ export interface VirtualRange {
 export interface UseVirtualPagesOptions {
   pageCount: number
   /** 滚动容器 ref */
-  scrollRef: React.RefObject<HTMLDivElement>
-  /** 缓冲页数，默认 2 */
+  scrollRef: React.RefObject<HTMLDivElement | null>
+  /** 缓冲页数，默认 PDF_VISIBLE_BUFFER */
   buffer?: number
+  /**
+   * 获取第 pageNum 页的顶部偏移（像素）
+   * 容错：pageNum 超出范围时返回安全值
+   */
+  getPageTop: (pageNum: number) => number
+  /**
+   * 获取第 pageNum 页的高度（像素）
+   */
+  getPageHeight: (pageNum: number) => number
 }
 
 /**
  * @returns visibleRange 当前应渲染的页码范围
- * @returns registerPage 注册页面 DOM 元素的回调（用于 IntersectionObserver 监听）
  */
 export function useVirtualPages({
   pageCount,
   scrollRef,
-  buffer = BUFFER_PAGES
+  buffer = PDF_VISIBLE_BUFFER,
+  getPageTop,
+  getPageHeight
 }: UseVirtualPagesOptions): {
   visibleRange: VirtualRange
-  registerPage: (pageNum: number, el: HTMLElement | null) => void
 } {
   const [visibleRange, setVisibleRange] = useState<VirtualRange>({
     start: 1,
     end: Math.min(pageCount, 1 + buffer * 2)
   })
 
-  const pageElementsRef = useRef<Map<number, HTMLElement>>(new Map())
-  const observerRef = useRef<IntersectionObserver | null>(null)
+  // 缓存上次计算范围避免重复 setState
+  const lastRangeRef = useRef<VirtualRange>({ start: 1, end: 1 })
 
-  // 注册/注销页面 DOM 元素
-  const registerPage = useCallback((pageNum: number, el: HTMLElement | null) => {
-    const map = pageElementsRef.current
-    const observer = observerRef.current
-    if (el) {
-      map.set(pageNum, el)
-      observer?.observe(el)
-    } else {
-      const old = map.get(pageNum)
-      if (old) observer?.unobserve(old)
-      map.delete(pageNum)
-    }
-  }, [])
+  const computeVisible = useCallback(() => {
+    const el = scrollRef.current
+    if (!el || pageCount === 0) return
 
-  useEffect(() => {
-    const scrollEl = scrollRef.current
-    if (!scrollEl || pageCount === 0) return
+    const scrollTop = el.scrollTop
+    const viewportHeight = el.clientHeight
+    const bufferMargin = viewportHeight * 0.5 // 额外缓冲：半个视口高度
 
-    // 收集当前可见页码
-    const computeVisible = () => {
-      const el = scrollRef.current
-      if (!el) return
-      const rect = el.getBoundingClientRect()
-      const top = rect.top
-      const bottom = rect.bottom
-      const visiblePages: number[] = []
+    const viewTop = scrollTop - bufferMargin
+    const viewBottom = scrollTop + viewportHeight + bufferMargin
 
-      pageElementsRef.current.forEach((pageEl, pageNum) => {
-        const r = pageEl.getBoundingClientRect()
-        // 页面与视口有交集即为可见
-        if (r.bottom > top && r.top < bottom) {
-          visiblePages.push(pageNum)
-        }
-      })
+    let start = pageCount
+    let end = 1
 
-      if (visiblePages.length === 0) return
+    for (let i = 1; i <= pageCount; i++) {
+      const top = getPageTop(i)
+      const height = getPageHeight(i)
+      const bottom = top + height
 
-      const minPage = Math.min(...visiblePages)
-      const maxPage = Math.max(...visiblePages)
-
-      const newStart = Math.max(1, minPage - buffer)
-      const newEnd = Math.min(pageCount, maxPage + buffer)
-
-      setVisibleRange((prev) => {
-        if (prev.start === newStart && prev.end === newEnd) return prev
-        return { start: newStart, end: newEnd }
-      })
-    }
-
-    // 首次计算
-    computeVisible()
-
-    // 滚动时重新计算
-    const onScroll = () => computeVisible()
-    scrollEl.addEventListener('scroll', onScroll, { passive: true })
-
-    // ResizeObserver 监听容器尺寸变化（缩放导致页面高度变化）
-    const ro = new ResizeObserver(() => computeVisible())
-    ro.observe(scrollEl)
-
-    return () => {
-      scrollEl.removeEventListener('scroll', onScroll)
-      ro.disconnect()
-    }
-  }, [pageCount, scrollRef, buffer])
-
-  // IntersectionObserver 在页面元素动态增删时触发可见范围更新
-  useEffect(() => {
-    const observer = new IntersectionObserver(
-      () => {
-        // 委托给 scroll handler 中的 computeVisible 逻辑
-        const el = scrollRef.current
-        if (!el) return
-        const rect = el.getBoundingClientRect()
-        const top = rect.top
-        const bottom = rect.bottom
-        const visiblePages: number[] = []
-
-        pageElementsRef.current.forEach((pageEl, pageNum) => {
-          const r = pageEl.getBoundingClientRect()
-          if (r.bottom > top && r.top < bottom) {
-            visiblePages.push(pageNum)
-          }
-        })
-
-        if (visiblePages.length === 0) return
-
-        const minPage = Math.min(...visiblePages)
-        const maxPage = Math.max(...visiblePages)
-
-        setVisibleRange((prev) => {
-          const newStart = Math.max(1, minPage - buffer)
-          const newEnd = Math.min(pageCount, maxPage + buffer)
-          if (prev.start === newStart && prev.end === newEnd) return prev
-          return { start: newStart, end: newEnd }
-        })
-      },
-      {
-        root: scrollRef.current,
-        // 扩大检测范围，确保缓冲页也被感知
-        rootMargin: '200% 0px 200% 0px',
-        threshold: 0
+      // 页面与扩展视口有交集
+      if (bottom >= viewTop && top <= viewBottom) {
+        if (i < start) start = i
+        if (i > end) end = i
       }
-    )
+      // 如果页面完全在扩展视口上方，且已找到页 → 后续页也不会可见
+      if (bottom < viewTop && end > 0 && i > end + buffer * 3) break
+    }
 
-    observerRef.current = observer
+    const newStart = Math.max(1, start - buffer)
+    const newEnd = Math.min(pageCount, end + buffer)
 
-    // 重新观察已注册的元素
-    pageElementsRef.current.forEach((el) => observer.observe(el))
+    const prev = lastRangeRef.current
+    if (prev.start === newStart && prev.end === newEnd) return
+    lastRangeRef.current = { start: newStart, end: newEnd }
+    setVisibleRange({ start: newStart, end: newEnd })
+  }, [scrollRef, pageCount, buffer, getPageTop, getPageHeight])
+
+  // 初始计算
+  useEffect(() => {
+    computeVisible()
+  }, [computeVisible])
+
+  // 监听滚动事件
+  useEffect(() => {
+    const el = scrollRef.current
+    if (!el) return
+
+    let rafId = 0
+    const onScroll = () => {
+      if (rafId) return
+      rafId = requestAnimationFrame(() => {
+        rafId = 0
+        computeVisible()
+      })
+    }
+
+    el.addEventListener('scroll', onScroll, { passive: true })
+
+    // ResizeObserver 监听容器尺寸变化
+    const ro = new ResizeObserver(() => computeVisible())
+    ro.observe(el)
 
     return () => {
-      observer.disconnect()
-      observerRef.current = null
+      el.removeEventListener('scroll', onScroll)
+      ro.disconnect()
+      if (rafId) cancelAnimationFrame(rafId)
     }
-  }, [pageCount, scrollRef, buffer])
+  }, [scrollRef, computeVisible])
 
-  return { visibleRange, registerPage }
+  return { visibleRange }
 }

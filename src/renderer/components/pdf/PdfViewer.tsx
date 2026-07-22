@@ -1,8 +1,12 @@
 /**
  * PDF 阅读器 — 容器组件
  *
- * P-10：绑定面板 + 创建笔记对话框 + lastPage 持久化
- * 修复：虚拟化渲染（只渲染视口±2页）+ 页面占位高度 + 正确的初始页跳转 + lastPage 恢复
+ * O-01 优化：
+ * - 分阶段加载（Stage A：立即显示 toolbar；Stage B/C 后台异步）
+ * - 懒加载页面尺寸（usePageDimensions）
+ * - DOM 窗口化（只渲染可见页，scrollTop 驱动）
+ * - 渲染优先级队列（PdfRenderQueue）
+ * - Canvas devicePixelRatio 适配
  */
 
 import React, { useEffect, useRef, useState, useCallback } from 'react'
@@ -12,14 +16,18 @@ import { pdfService } from '../../services/pdf.service'
 import { bindingService } from '../../services/binding.service'
 import { PdfJsEngine } from './engine/PdfJsEngine'
 import { PageCache } from './pageCache'
+import { PdfRenderQueue, RenderPriority } from './renderQueue'
 import { useVirtualPages } from './useVirtualPages'
+import { usePageDimensions } from './usePageDimensions'
 import PdfToolbar from './PdfToolbar'
-import TagInput from '../tags/TagInput'
+import BookmarkPanel from './BookmarkPanel'
 import BoundNotesPanel from './BoundNotesPanel'
 import CreateNoteDialog from './CreateNoteDialog'
 import PdfFindBar from './PdfFindBar'
-import type { PdfEngine, PageDimension } from './engine/PdfEngine'
+import type { PdfEngine } from './engine/PdfEngine'
 import type { Annotation } from '../../../shared/types'
+
+const PAGE_GAP = 16
 
 const PdfViewer: React.FC = () => {
   const dock = useWorkspaceStore((s) => s.dock)
@@ -31,14 +39,13 @@ const PdfViewer: React.FC = () => {
   const openSplit = useWorkspaceStore((s) => s.openSplit)
   const engineRef = useRef<PdfEngine | null>(null)
   const cacheRef = useRef(new PageCache())
+  const renderQueueRef = useRef(new PdfRenderQueue(2))
   const scrollRef = useRef<HTMLDivElement>(null)
-  /** 用户主动跳页标记：true 时才执行 scrollIntoView；滚动自然推进页码时不触发 */
+  /** 用户主动跳页标记 */
   const userJumpRef = useRef(false)
-  /** 初始跳页是否已执行（避免重复跳转） */
   const initialJumpDoneRef = useRef(false)
 
   const [pageCount, setPageCount] = useState(0)
-  const [pageDimensions, setPageDimensions] = useState<PageDimension[]>([])
   const [, forceUpdate] = useState(0)
   const [showCreateDialog, setShowCreateDialog] = useState(false)
   const [sidePanelOpen, setSidePanelOpen] = useState(true)
@@ -46,90 +53,175 @@ const PdfViewer: React.FC = () => {
   const [boundNotesOpen, setBoundNotesOpen] = useState(true)
   const [annotationsOpen, setAnnotationsOpen] = useState(true)
 
-  // ── 虚拟化 ───────────────────────────────────
-  const { visibleRange, registerPage } = useVirtualPages({
+  /** targetPage：优先 dock 指定页，其次 meta.lastPage，最后第 1 页 */
+  const targetPageRef = useRef(1)
+
+  // ── 懒加载尺寸 Hook ───────────────────────
+  const { dims, ensureDim, estimateHeight, preloadRange } = usePageDimensions(
+    engineRef.current,
     pageCount,
-    scrollRef
+    targetPageRef.current
+  )
+
+  // ── 计算 getPageTop / getPageHeight ──────────
+  const getPageTop = useCallback(
+    (pageNum: number): number => {
+      let offset = 0
+      for (let i = 1; i < pageNum; i++) {
+        offset += estimateHeight(i, pdf.scale) + PAGE_GAP
+      }
+      return offset
+    },
+    [estimateHeight, pdf.scale]
+  )
+
+  const getPageHeight = useCallback(
+    (pageNum: number): number => {
+      const d = dims[pageNum - 1]
+      if (d) return Math.ceil(d.height * pdf.scale)
+      return estimateHeight(pageNum, pdf.scale)
+    },
+    [dims, estimateHeight, pdf.scale]
+  )
+
+  const totalHeight = (() => {
+    let sum = 0
+    for (let i = 1; i <= pageCount; i++) {
+      sum += getPageHeight(i) + PAGE_GAP
+    }
+    return sum
+  })()
+
+  // ── 虚拟化 ───────────────────────────────────
+  const { visibleRange } = useVirtualPages({
+    pageCount,
+    scrollRef,
+    getPageTop,
+    getPageHeight
   })
 
-  // ── 打开 PDF ────────────────────────────────
+  // ════════════════════════════════════════════
+  // Stage A: 打开 PDF → 立即显示 toolbar
+  // Stage B: 并行获取 meta + boundNotes
+  // Stage C: 后台懒加载页面尺寸
+  // ════════════════════════════════════════════
 
   useEffect(() => {
     if (!pdfPath) return
-    // pdfPath 未变且 engine 仍在内存中 → 跳过重建（避免分屏切换时重复加载）
+    // pdfPath 未变且 engine 仍存活 → 跳过
     if (pdfPath === pdf.pdfPath && engineRef.current) return
+
+    // 确定目标页
+    const targetPage = (page > 1 ? page : 0) || 1
+    targetPageRef.current = targetPage
 
     pdf.setLoading(true)
     initialJumpDoneRef.current = false
-    const cache = cacheRef.current
-    cache.clear()
+    cacheRef.current.clear()
+    renderQueueRef.current.clear()
+    setPageCount(0)
 
     ;(async () => {
+      // Stage A（阻塞最短）：读取 buffer → engine.open → 得到 pageCount
       const buf = await pdfService.readBuffer(pdfPath)
       const engine = new PdfJsEngine()
       await engine.open(buf)
       engineRef.current = engine
 
-      const meta = await pdfService.getMeta(pdfPath)
-      const bns = await bindingService.listBoundNotes(pdfPath).catch(() => [])
-      pdf.open(pdfPath, meta, bns)
-      setPageCount(engine.getPageCount())
+      const count = engine.getPageCount()
+      setPageCount(count)
 
-      // 批量获取所有页面尺寸（不触发渲染，仅 viewport，快速）
-      const dims = await engine.getPageDimensions()
-      setPageDimensions(dims)
+      // 预加载目标页尺寸（首屏立即需要）
+      if (targetPage <= count) {
+        ensureDim(targetPage).catch(() => {})
+        if (targetPage > 1) ensureDim(targetPage - 1).catch(() => {})
+        if (targetPage < count) ensureDim(targetPage + 1).catch(() => {})
+      }
 
-      // 恢复阅读位置：优先 dock 指定页，其次 sidecar lastPage (FR-4.4)，最后第 1 页
-      const targetPage = (page > 1 ? page : 0) || (meta.lastPage > 0 ? meta.lastPage : 0) || 1
+      // Stage A 完成 → 立即显示 UI（占位 meta，Stage B 再更新）
+      const placeholderMeta = {
+        version: 3,
+        file: pdfPath.split('/').pop() ?? 'unknown.pdf',
+        bookmarks: [],
+        lastPage: targetPage,
+        boundNotes: [],
+        annotations: [],
+        updatedAt: new Date().toISOString()
+      }
+      pdf.open(pdfPath, placeholderMeta, [])
+      pdf.setLoading(false)
+
+      // 初始跳转目标页
       userJumpRef.current = true
       setPage(targetPage)
       forceUpdate((n) => n + 1)
-      pdf.setLoading(false)
+
+      // Stage B（后台）：并行获取 meta + boundNotes
+      const [meta, bns] = await Promise.all([
+        pdfService.getMeta(pdfPath).catch(() => null),
+        bindingService.listBoundNotes(pdfPath).catch(() => [])
+      ])
+
+      if (meta && pdfPath === pdf.pdfPath) {
+        pdf.setMeta(meta)
+        pdf.setBoundNotes(bns)
+        // 最后修正 targetPage（meta.lastPage 可能更精确）
+        const finalTarget = (page > 1 ? page : 0) || (meta.lastPage > 0 ? meta.lastPage : 0) || targetPage
+        if (finalTarget !== targetPage && finalTarget <= count) {
+          userJumpRef.current = true
+          setPage(finalTarget)
+        }
+      }
+
+      // Stage C（后台）：懒加载可见范围尺寸
+      preloadRange(1, Math.min(count, 10))
     })()
 
     return () => {
       engineRef.current?.close()
-      cache.clear()
+      cacheRef.current.clear()
+      renderQueueRef.current.clear()
       engineRef.current = null
     }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [pdfPath])
+  }, [pdfPath, pdf.pdfPath])
 
-  // ── 用户主动跳页时滚动到对应页 ──────────────
+  // ── 用户主动跳页 → 滚动 ──────────────────
 
   useEffect(() => {
-    if (!userJumpRef.current) return  // 滚动自然推进的页码不触发
+    if (!userJumpRef.current) return
     if (!scrollRef.current || !pageCount) return
-    if (pageDimensions.length === 0) return  // 等待尺寸就绪
 
-    const pageEl = scrollRef.current.querySelector(`[data-page="${page}"]`)
-    if (!pageEl) {
-      // 页面元素可能尚未挂载（虚拟化），延迟重试
-      const timer = setTimeout(() => {
-        userJumpRef.current = false
-      }, 300)
-      return () => clearTimeout(timer)
-    }
+    // 用 requestAnimationFrame 等待虚拟化挂载
+    const raf = requestAnimationFrame(() => {
+      const targetTop = getPageTop(page)
+      scrollRef.current?.scrollTo({ top: targetTop, behavior: 'instant' })
+      userJumpRef.current = false
+      initialJumpDoneRef.current = true
+      // 预加载可见范围尺寸
+      preloadRange(visibleRange.start, visibleRange.end)
+    })
+    return () => cancelAnimationFrame(raf)
+  }, [page, pageCount, getPageTop, visibleRange, preloadRange])
 
-    pageEl.scrollIntoView({ block: 'start' })
-    userJumpRef.current = false
-    initialJumpDoneRef.current = true
-  }, [page, pageCount, pageDimensions])
+  /** 用户主动跳页 */
+  const jumpToPage = useCallback(
+    (n: number) => {
+      userJumpRef.current = true
+      setPage(n)
+      ensureDim(n).catch(() => {})
+    },
+    [setPage, ensureDim]
+  )
 
-  /** 用户主动跳页（按钮/标注/输入框） */
-  const jumpToPage = useCallback((n: number) => {
-    userJumpRef.current = true
-    setPage(n)
-  }, [setPage])
-
-  // ── 缩放变化 → 清缓存重渲染 ────────────────
+  // ── 缩放变化 → 清缓存 ────────────────────
 
   useEffect(() => {
     cacheRef.current.clear()
+    renderQueueRef.current.clear()
     forceUpdate((n) => n + 1)
   }, [pdf.scale])
 
-  // ── lastPage 防抖落盘 ──────────────────────
+  // ── lastPage 防抖落盘 ────────────────────
 
   useEffect(() => {
     if (!pdfPath || page <= 0) return
@@ -139,40 +231,23 @@ const PdfViewer: React.FC = () => {
     return () => clearTimeout(timer)
   }, [page, pdfPath])
 
-  // ── 创建绑定笔记 ────────────────────────────
+  // ── 创建绑定笔记 ────────────────────────
 
   const handleCreateNote = async (name: string) => {
     setShowCreateDialog(false)
     try {
-      const noteRel = await bindingService.createBoundNote(pdfPath!, { name: name.endsWith('.md') ? name : name + '.md' })
-      // 刷新绑定列表
+      const noteRel = await bindingService.createBoundNote(pdfPath!, {
+        name: name.endsWith('.md') ? name : name + '.md'
+      })
       const bns = await bindingService.listBoundNotes(pdfPath!)
       pdf.setBoundNotes(bns)
-      // 进入分屏
       openSplit(pdfPath!, noteRel, { page })
     } catch {
-      // P-12 提示错误
+      // ignore
     }
   }
 
-  // 默认笔记名
-  const defaultNoteName = `《${pdfPath?.split('/').pop()?.replace('.pdf','') ?? 'PDF'}》笔记 ${(pdf.boundNotes?.length ?? 0) + 1}`
-
-  // ── 计算占位总高度，确保滚动条正确 ──────────
-
-  const pageGap = 16 // PageCanvas marginBottom
-  const totalHeight = pageDimensions.reduce((sum, dim) => {
-    return sum + Math.ceil(dim.height * pdf.scale) + pageGap
-  }, 0)
-
-  // 计算目标页之前所有页面的累计高度（用于精确滚动定位）
-  const getOffsetTop = useCallback((targetPage: number): number => {
-    let offset = 0
-    for (let i = 0; i < targetPage - 1 && i < pageDimensions.length; i++) {
-      offset += Math.ceil(pageDimensions[i].height * pdf.scale) + pageGap
-    }
-    return offset
-  }, [pageDimensions, pdf.scale])
+  const defaultNoteName = `《${pdfPath?.split('/').pop()?.replace('.pdf', '') ?? 'PDF'}》笔记 ${(pdf.boundNotes?.length ?? 0) + 1}`
 
   // ── 渲染 ────────────────────────────────────
 
@@ -180,8 +255,26 @@ const PdfViewer: React.FC = () => {
     return <div style={styles.empty}>打开一个 PDF 开始阅读</div>
   }
 
-  if (pdf.loading) {
-    return <div style={styles.empty}>加载中…</div>
+  // loading 仅表示 engine 尚未 open（极短），期间仍显示 toolbar 骨架
+  if (pdf.loading || pageCount === 0) {
+    return (
+      <div style={styles.container}>
+        <PdfToolbar
+          page={1}
+          pageCount={0}
+          scale={1}
+          onPageChange={() => {}}
+          onScaleChange={() => {}}
+          onCreateNote={() => {}}
+          sidePanelOpen={sidePanelOpen}
+          onToggleSidePanel={() => setSidePanelOpen(!sidePanelOpen)}
+          onToggleFind={() => {}}
+          isSplit={dock?.mode === 'split'}
+          onCollapseNote={() => useWorkspaceStore.getState().closeNote()}
+        />
+        <div style={{ ...styles.empty, flex: 1 }}>加载中...</div>
+      </div>
+    )
   }
 
   return (
@@ -200,7 +293,11 @@ const PdfViewer: React.FC = () => {
         onCollapseNote={() => useWorkspaceStore.getState().closeNote()}
       />
       {showFind && engineRef.current && (
-        <PdfFindBar engine={engineRef.current} pageCount={pageCount} onClose={() => setShowFind(false)} />
+        <PdfFindBar
+          engine={engineRef.current}
+          pageCount={pageCount}
+          onClose={() => setShowFind(false)}
+        />
       )}
       <div style={{ display: 'flex', flex: 1, overflow: 'hidden' }}>
         <div
@@ -208,67 +305,79 @@ const PdfViewer: React.FC = () => {
           style={{ ...styles.scroller, flex: 1 }}
           onScroll={() => {
             const el = scrollRef.current
-            if (!el || pageDimensions.length === 0) return
-            // 基于滚动位置精确计算当前页码（使用占位高度，无需依赖已渲染的 DOM）
+            if (!el || pageCount === 0) return
             const scrollTop = el.scrollTop
             const viewportTop = el.getBoundingClientRect().top
-            // 视口 30% 处作为"当前页"判定线
             const targetY = viewportTop + el.clientHeight * 0.3
 
-            let accumulated = 0
             let bestPage = 1
-            for (let i = 0; i < pageDimensions.length; i++) {
-              const pageHeight = Math.ceil(pageDimensions[i].height * pdf.scale) + pageGap
-              const pageTop = accumulated
-              const pageBottom = accumulated + pageHeight
-              // 转为屏幕坐标：页面顶部相对视口的位置
+            for (let i = 1; i <= pageCount; i++) {
+              const pageTop = getPageTop(i)
               const screenTop = el.offsetTop + pageTop - scrollTop
-              const screenBottom = screenTop + pageHeight
               if (screenTop <= targetY) {
-                bestPage = i + 1
+                bestPage = i
+              } else {
+                break
               }
-              accumulated = pageBottom
             }
-            // 滚动自然推进页码，不触发 scrollIntoView
             if (bestPage !== page) setPage(bestPage)
+
+            // 滚动时预加载尺寸
+            preloadRange(visibleRange.start, visibleRange.end)
           }}
         >
-          {/* 总高度占位容器：确保滚动条正确 */}
+          {/* 总高度占位容器 */}
           <div style={{ height: totalHeight, position: 'relative' }}>
-            {Array.from({ length: pageCount }, (_, i) => {
-              const pageNum = i + 1
-              const dim = pageDimensions[i]
-              const pageHeight = dim ? Math.ceil(dim.height * pdf.scale) : 0
-              const offsetTop = getOffsetTop(pageNum)
-
-              // 虚拟化：只渲染可见范围内的页面
-              const isVisible = pageNum >= visibleRange.start && pageNum <= visibleRange.end
+            {Array.from({ length: visibleRange.end - visibleRange.start + 1 }, (_, i) => {
+              const pageNum = visibleRange.start + i
+              const dim = dims[pageNum - 1]
+              const pageHeight = getPageHeight(pageNum)
+              const offsetTop = getPageTop(pageNum)
 
               return (
                 <div
                   key={pageNum}
                   data-page={pageNum}
-                  ref={(el) => registerPage(pageNum, el)}
                   style={{
                     position: 'absolute',
                     top: offsetTop,
                     left: 0,
                     right: 0,
-                    height: pageHeight + pageGap,
+                    height: pageHeight + PAGE_GAP,
                     display: 'flex',
-                    justifyContent: 'center'
+                    justifyContent: 'center',
+                    alignItems: 'flex-start'
                   }}
                 >
-                  {isVisible && dim ? (
+                  {dim ? (
                     <PageCanvas
                       pageNum={pageNum}
                       engine={engineRef.current}
                       cache={cacheRef.current}
+                      renderQueue={renderQueueRef.current}
                       scale={pdf.scale}
                       pageWidth={Math.ceil(dim.width * pdf.scale)}
                       pageHeight={pageHeight}
+                      priority={
+                        pageNum === page
+                          ? RenderPriority.Current
+                          : Math.abs(pageNum - page) === 1
+                            ? RenderPriority.Adjacent
+                            : RenderPriority.Visible
+                      }
                     />
-                  ) : null}
+                  ) : (
+                    /* 尺寸未就绪 → 灰色骨架占位 */
+                    <div
+                      style={{
+                        width: '70%',
+                        height: pageHeight,
+                        backgroundColor: 'var(--bg-tertiary)',
+                        borderRadius: 2,
+                        opacity: 0.3
+                      }}
+                    />
+                  )}
                 </div>
               )
             })}
@@ -277,61 +386,96 @@ const PdfViewer: React.FC = () => {
 
         {/* 标注侧栏（可折叠） */}
         {sidePanelOpen && (
-        <div style={styles.sidePanel}>
-          <div style={styles.sideTitle}>标签</div>
-          <div style={{ padding: '0 8px' }}>
-            <TagInput
-              tags={pdf.meta?.tags ?? []}
-              onChange={async (tags: string[]) => {
-                if (!pdf.meta) return
-                await pdfService.updateMeta(pdfPath, { tags })
-                pdf.setMeta({ ...pdf.meta, tags })
+          <div style={styles.sidePanel}>
+            <div style={styles.sideTitle}>书签</div>
+            <BookmarkPanel
+              pdfPath={pdfPath}
+              engine={engineRef.current}
+              bookmarks={pdf.meta?.bookmarks ?? []}
+              currentPage={page}
+              onJump={jumpToPage}
+              onBookmarksChange={(bookmarks) => {
+                if (pdf.meta) {
+                  pdf.setMeta({ ...pdf.meta, bookmarks })
+                }
               }}
             />
-          </div>
 
-          <div
-            style={{ ...styles.sideTitle, marginTop: 12, cursor: 'pointer', display: 'flex', justifyContent: 'space-between' }}
-            onClick={() => setBoundNotesOpen(!boundNotesOpen)}
-          >
-            <span>关联笔记</span>
-            <span>{boundNotesOpen ? '▾' : '▸'}</span>
-          </div>
-          {boundNotesOpen && <BoundNotesPanel pdfPath={pdfPath} />}
+            <div
+              style={{
+                ...styles.sideTitle,
+                marginTop: 12,
+                cursor: 'pointer',
+                display: 'flex',
+                justifyContent: 'space-between'
+              }}
+              onClick={() => setBoundNotesOpen(!boundNotesOpen)}
+            >
+              <span>关联笔记</span>
+              <span>{boundNotesOpen ? '▾' : '▸'}</span>
+            </div>
+            {boundNotesOpen && <BoundNotesPanel pdfPath={pdfPath} />}
 
-          <div
-            style={{ ...styles.sideTitle, marginTop: 12, cursor: 'pointer', display: 'flex', justifyContent: 'space-between' }}
-            onClick={() => setAnnotationsOpen(!annotationsOpen)}
-          >
-            <span>标注</span>
-            <span>{annotationsOpen ? '▾' : '▸'}</span>
-          </div>
-          {annotationsOpen && (
-          <div style={styles.annList}>
-            {(pdf.meta?.annotations ?? []).map((ann: Annotation) => (
-              <div
-                key={ann.id}
-                onClick={() => {
-                  pdf.selectAnnotation(ann.id)
-                  jumpToPage(ann.page)
-                }}
-                style={{
-                  ...styles.annItem,
-                  backgroundColor: pdf.selectedAnnotationId === ann.id ? 'var(--bg-active)' : 'transparent'
-                }}
-              >
-                <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
-                  <span style={{ width: 10, height: 10, borderRadius: 2, backgroundColor: ann.color, flexShrink: 0 }} />
-                  <span style={{ fontSize: 11, color: 'var(--text-tertiary)' }}>p.{ann.page}</span>
-                </div>
-                {ann.comment && (
-                  <div style={{ fontSize: 11, color: 'var(--text-secondary)', marginTop: 2 }}>{ann.comment}</div>
-                )}
+            <div
+              style={{
+                ...styles.sideTitle,
+                marginTop: 12,
+                cursor: 'pointer',
+                display: 'flex',
+                justifyContent: 'space-between'
+              }}
+              onClick={() => setAnnotationsOpen(!annotationsOpen)}
+            >
+              <span>标注</span>
+              <span>{annotationsOpen ? '▾' : '▸'}</span>
+            </div>
+            {annotationsOpen && (
+              <div style={styles.annList}>
+                {(pdf.meta?.annotations ?? []).map((ann: Annotation) => (
+                  <div
+                    key={ann.id}
+                    onClick={() => {
+                      pdf.selectAnnotation(ann.id)
+                      jumpToPage(ann.page)
+                    }}
+                    style={{
+                      ...styles.annItem,
+                      backgroundColor:
+                        pdf.selectedAnnotationId === ann.id
+                          ? 'var(--bg-active)'
+                          : 'transparent'
+                    }}
+                  >
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                      <span
+                        style={{
+                          width: 10,
+                          height: 10,
+                          borderRadius: 2,
+                          backgroundColor: ann.color,
+                          flexShrink: 0
+                        }}
+                      />
+                      <span style={{ fontSize: 11, color: 'var(--text-tertiary)' }}>
+                        p.{ann.page}
+                      </span>
+                    </div>
+                    {ann.comment && (
+                      <div
+                        style={{
+                          fontSize: 11,
+                          color: 'var(--text-secondary)',
+                          marginTop: 2
+                        }}
+                      >
+                        {ann.comment}
+                      </div>
+                    )}
+                  </div>
+                ))}
               </div>
-            ))}
+            )}
           </div>
-          )}
-        </div>
         )}
       </div>
 
@@ -346,75 +490,145 @@ const PdfViewer: React.FC = () => {
   )
 }
 
-// ── 单页 Canvas 组件 ─────────────────────────────
+// ── 单页 Canvas 组件（使用渲染队列 + devicePixelRatio 适配） ─────
 
 const PageCanvas: React.FC<{
   pageNum: number
   engine: PdfEngine | null
   cache: PageCache
+  renderQueue: PdfRenderQueue
   scale: number
   pageWidth: number
   pageHeight: number
-}> = React.memo(({ pageNum, engine, cache, scale, pageWidth, pageHeight }) => {
-  const canvasRef = useRef<HTMLCanvasElement>(null)
-  const renderedScaleRef = useRef(0)
+  priority: number
+}> = React.memo(
+  ({ pageNum, engine, cache, renderQueue, scale, pageWidth, pageHeight, priority }) => {
+    const canvasRef = useRef<HTMLCanvasElement>(null)
+    const renderedKeyRef = useRef(0) // 用于判断是否需要重渲染
 
-  useEffect(() => {
-    if (!engine || !canvasRef.current) return
-    // 同 scale 已渲染过则跳过（但缓存被清除后需重新渲染）
-    if (renderedScaleRef.current === scale) {
-      const cached = cache.get(pageNum)
-      if (cached) {
-        // 使用缓存：把缓存的 canvas 内容复制到当前 canvas
-        const ctx = canvasRef.current.getContext('2d')
-        if (ctx && cached !== canvasRef.current) {
-          canvasRef.current.width = cached.width
-          canvasRef.current.height = cached.height
-          ctx.drawImage(cached, 0, 0)
+    useEffect(() => {
+      if (!engine || !canvasRef.current) return
+
+      const canvas = canvasRef.current
+      const renderKey = scale * 1000 + pageNum
+      if (renderedKeyRef.current === renderKey) {
+        // 同 scale+pageNum 已有缓存 → 快速恢复
+        const cached = cache.get(pageNum)
+        if (cached && cached !== canvas) {
+          const ctx = canvas.getContext('2d')
+          if (ctx) {
+            canvas.width = cached.width
+            canvas.height = cached.height
+            ctx.drawImage(cached, 0, 0)
+          }
         }
         return
       }
-    }
 
-    const canvas = canvasRef.current
-    let cancelled = false
+      let cancelled = false
 
-    engine.getPage(pageNum).then(async (result) => {
-      if (cancelled) return
-      await result.renderTo(canvas, scale)
-      if (cancelled) return
-      cache.set(pageNum, canvas)
-      renderedScaleRef.current = scale
-    })
+      renderQueue.enqueue(pageNum, priority, async () => {
+        if (cancelled) return
+        const result = await engine.getPage(pageNum).catch(() => null)
+        if (cancelled || !result) return
 
-    return () => { cancelled = true }
-  }, [engine, pageNum, scale, cache])
+        const dpr = Math.min(window.devicePixelRatio || 1, 2)
+        const scaledW = Math.floor(pageWidth * dpr)
+        const scaledH = Math.floor(pageHeight * dpr)
 
-  return (
-    <canvas
-      ref={canvasRef}
-      width={pageWidth}
-      height={pageHeight}
-      style={{
-        width: `${pageWidth}px`,
-        height: `${pageHeight}px`,
-        boxShadow: '0 1px 6px rgba(0,0,0,0.1)',
-        borderRadius: 2
-      }}
-    />
-  )
-})
+        // 单页像素上限保护
+        if (scaledW * scaledH > 16_000_000) {
+          // 超出上限，降 DPR
+          const safeDpr = Math.sqrt(16_000_000 / (pageWidth * pageHeight))
+          const safeW = Math.floor(pageWidth * safeDpr)
+          const safeH = Math.floor(pageHeight * safeDpr)
+          canvas.width = safeW
+          canvas.height = safeH
+          canvas.style.width = `${pageWidth}px`
+          canvas.style.height = `${pageHeight}px`
+          await result.renderTo(canvas, scale * safeDpr)
+        } else {
+          canvas.width = Math.floor(pageWidth * dpr)
+          canvas.height = Math.floor(pageHeight * dpr)
+          canvas.style.width = `${pageWidth}px`
+          canvas.style.height = `${pageHeight}px`
+          // 用物理像素渲染：scale * dpr 确保高 DPI 屏清晰
+          const tempCanvas = document.createElement('canvas')
+          await result.renderTo(tempCanvas, scale * dpr)
+          canvas.width = tempCanvas.width
+          canvas.height = tempCanvas.height
+          canvas.style.width = `${Math.floor(tempCanvas.width / dpr)}px`
+          canvas.style.height = `${Math.floor(tempCanvas.height / dpr)}px`
+          const ctx2 = canvas.getContext('2d')
+          if (ctx2) ctx2.drawImage(tempCanvas, 0, 0)
+        }
+
+        if (!cancelled) {
+          cache.set(pageNum, canvas)
+          renderedKeyRef.current = renderKey
+        }
+      })
+
+      return () => {
+        cancelled = true
+        renderQueue.cancel(pageNum)
+      }
+    }, [engine, pageNum, scale, pageWidth, pageHeight, priority, cache, renderQueue])
+
+    return (
+      <canvas
+        ref={canvasRef}
+        width={pageWidth}
+        height={pageHeight}
+        style={{
+          width: `${pageWidth}px`,
+          height: `${pageHeight}px`,
+          boxShadow: '0 1px 6px rgba(0,0,0,0.1)',
+          borderRadius: 2
+        }}
+      />
+    )
+  }
+)
 
 // ── 样式 ──────────────────────────────────────────
 
 const styles: Record<string, React.CSSProperties> = {
   container: { display: 'flex', flexDirection: 'column', height: '100%' },
-  scroller: { overflow: 'auto', padding: '16px 0', backgroundColor: 'var(--bg-tertiary)' },
-  empty: { display: 'flex', alignItems: 'center', justifyContent: 'center', height: '100%', fontSize: 14, color: 'var(--text-tertiary)' },
-  sidePanel: { width: 200, minWidth: 160, backgroundColor: 'var(--bg-secondary)', borderLeft: '1px solid var(--border-primary)', overflowY: 'auto', flexShrink: 0 },
-  sideTitle: { padding: '8px 12px', fontSize: 11, fontWeight: 600, color: 'var(--text-tertiary)', borderBottom: '1px solid var(--border-secondary)' },
+  scroller: {
+    overflow: 'auto',
+    padding: '16px 0',
+    backgroundColor: 'var(--bg-tertiary)'
+  },
+  empty: {
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'center',
+    height: '100%',
+    fontSize: 14,
+    color: 'var(--text-tertiary)'
+  },
+  sidePanel: {
+    width: 200,
+    minWidth: 160,
+    backgroundColor: 'var(--bg-secondary)',
+    borderLeft: '1px solid var(--border-primary)',
+    overflowY: 'auto',
+    flexShrink: 0
+  },
+  sideTitle: {
+    padding: '8px 12px',
+    fontSize: 11,
+    fontWeight: 600,
+    color: 'var(--text-tertiary)',
+    borderBottom: '1px solid var(--border-secondary)'
+  },
   annList: { padding: '4px 0' },
-  annItem: { padding: '6px 12px', cursor: 'pointer', borderBottom: '1px solid var(--border-secondary)' }
+  annItem: {
+    padding: '6px 12px',
+    cursor: 'pointer',
+    borderBottom: '1px solid var(--border-secondary)'
+  }
 }
 
 export default PdfViewer

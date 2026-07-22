@@ -8,7 +8,6 @@ import FileTree from './components/file-tree/FileTree'
 import VaultSelector from './components/Sidebar/VaultSelector'
 import NoteEditor from './components/editor/NoteEditor'
 import PdfViewer from './components/pdf/PdfViewer'
-import TagPanel from './components/tags/TagPanel'
 import SearchPanel from './components/search/SearchPanel'
 import CommandPalette from './components/search/CommandPalette'
 import SettingsPage from './components/settings/SettingsPage'
@@ -32,15 +31,21 @@ const App: React.FC = () => {
   return (
     <div style={styles.root}>
       {/* 左侧栏 */}
-      <aside style={{ ...styles.sidebar, width: sidebarOpen ? 260 : 0, minWidth: sidebarOpen ? 200 : 0, overflow: sidebarOpen ? undefined : 'hidden' }}>
+      <aside style={{
+        ...styles.sidebar,
+        width: sidebarOpen ? 260 : 0,
+        minWidth: sidebarOpen ? 200 : 0,
+        overflow: sidebarOpen ? undefined : 'hidden',
+        borderRight: sidebarOpen ? '1px solid var(--border-primary)' : 'none'
+      }}>
         <div style={styles.sidebarHeader}>
           <span style={{ flex: 1 }}>KnowledgeBase</span>
           <button
-            onClick={() => setSidebarOpen(!sidebarOpen)}
-            style={{ border: 'none', background: 'none', cursor: 'pointer', fontSize: 14, color: 'var(--text-tertiary)', padding: '0 4px' }}
-            title={sidebarOpen ? '折叠侧栏' : '展开侧栏'}
+            onClick={() => setSidebarOpen(false)}
+            style={styles.sidebarToggle}
+            title="折叠侧栏"
           >
-            {sidebarOpen ? '◀' : '▶'}
+            ◀
           </button>
         </div>
         {sidebarOpen && (
@@ -49,10 +54,19 @@ const App: React.FC = () => {
             <div style={styles.treeContainer}>
               <FileTree />
             </div>
-            <TagPanel />
           </>
         )}
       </aside>
+
+      {!sidebarOpen && (
+        <button
+          onClick={() => setSidebarOpen(true)}
+          style={styles.sidebarFloatBtn}
+          title="展开侧栏"
+        >
+          ▶
+        </button>
+      )}
 
       {/* 主体 */}
       <main style={styles.main}>
@@ -105,6 +119,35 @@ const styles: Record<string, React.CSSProperties> = {
     WebkitUserSelect: 'none',
     display: 'flex',
     alignItems: 'center'
+  },
+  sidebarToggle: {
+    border: 'none',
+    background: 'none',
+    cursor: 'pointer',
+    fontSize: 14,
+    color: 'var(--text-tertiary)',
+    padding: '0 4px'
+  },
+  sidebarFloatBtn: {
+    position: 'fixed',
+    left: 0,
+    top: '50%',
+    transform: 'translateY(-50%)',
+    zIndex: 100,
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'center',
+    width: 24,
+    height: 48,
+    padding: 0,
+    border: '1px solid var(--border-primary)',
+    borderLeft: 'none',
+    borderRadius: '0 var(--radius-md) var(--radius-md) 0',
+    backgroundColor: 'var(--bg-secondary)',
+    color: 'var(--text-tertiary)',
+    fontSize: 12,
+    cursor: 'pointer',
+    boxShadow: 'var(--shadow-md)'
   },
   treeContainer: {
     flex: 1,

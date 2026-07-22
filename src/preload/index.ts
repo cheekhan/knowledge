@@ -51,8 +51,7 @@ const api: IpcApi = {
   pdf: {
     readBuffer: (relPath) => ipcRenderer.invoke('pdf:readBuffer', relPath),
     getMeta: (relPath) => ipcRenderer.invoke('pdf:getMeta', relPath),
-    updateMeta: (relPath, patch) => ipcRenderer.invoke('pdf:updateMeta', relPath, patch),
-    listByTag: (tag) => ipcRenderer.invoke('pdf:listByTag', tag)
+    updateMeta: (relPath, patch) => ipcRenderer.invoke('pdf:updateMeta', relPath, patch)
   },
 
   // ── binding ──────────────────────────────────────

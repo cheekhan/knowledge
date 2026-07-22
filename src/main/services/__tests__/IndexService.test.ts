@@ -96,13 +96,13 @@ describe('IndexService', () => {
       expect(hits[0].kind).toBe('pdf')
     })
 
-    it('按标签筛选 PDF', () => {
+    it('按文件名搜索 PDF（O-02 已移除 tag 筛选）', () => {
       fs.writeFileSync(path.join(vaultRoot, 'pdfs/book.pdf'), '%PDF')
       fs.writeFileSync(
         path.join(vaultRoot, 'pdfs/book.pdf' + SIDECAR_SUFFIX),
         JSON.stringify({
-          version: 2,
-          tags: ['计算机'],
+          version: 3,
+          bookmarks: [{ id: 'b1', title: '第一章', page: 5, createdAt: '2026-01-01T00:00:00Z' }],
           lastPage: 0,
           boundNotes: [],
           annotations: [],
@@ -111,7 +111,8 @@ describe('IndexService', () => {
       )
       indexService.indexPdf('pdfs/book.pdf')
 
-      const hits = indexService.query('', { scope: 'pdfs', tag: '计算机' })
+      // 按文件名搜索（非 tag 筛选）
+      const hits = indexService.query('book', { scope: 'pdfs' })
       expect(hits.length).toBeGreaterThanOrEqual(1)
     })
   })

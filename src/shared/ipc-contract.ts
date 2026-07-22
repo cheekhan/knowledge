@@ -131,13 +131,6 @@ export interface IpcApi {
      * @param patch 需要更新的字段（浅合并）
      */
     updateMeta(relPath: string, patch: Partial<PdfMeta>): Promise<void>
-
-    /**
-     * 按标签筛选 PDF 文件
-     * @param tag 标签名
-     * @returns 匹配的 PDF 相对路径列表
-     */
-    listByTag(tag: string): Promise<string[]>
   }
 
   // ==========================================

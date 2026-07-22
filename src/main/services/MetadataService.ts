@@ -34,12 +34,19 @@ const AnnotationSchema = z.object({
 export const PdfMetaSchema = z.object({
   version: z.number().default(META_VERSION),
   file: z.string().default(''),
-  tags: z.array(z.string()).default([]),
+  bookmarks: z.array(
+    z.object({
+      id: z.string(),
+      title: z.string(),
+      page: z.number().int().positive(),
+      createdAt: z.string()
+    })
+  ).default([]),
   lastPage: z.number().int().min(0).default(0),
   boundNotes: z.array(z.string()).default([]),
   annotations: z.array(AnnotationSchema).default([]),
   updatedAt: z.string().default('')
-})
+}).passthrough() // 兼容旧版 tags 字段，不会被 parse 拒绝
 
 // ── 服务 ────────────────────────────────────────────
 
@@ -90,7 +97,7 @@ export class MetadataService {
    * 部分更新 sidecar（read-modify-write + 原子写）
    *
    * @param pdfRel PDF 相对路径
-   * @param patch 需合并的字段（浅合并 tags/boundNotes/annotations 数组字段按替换）
+   * @param patch 需合并的字段（浅合并 bookmarks/boundNotes/annotations 数组字段按替换）
    */
   update(pdfRel: string, patch: Partial<PdfMeta>): void {
     const current = this.read(pdfRel)
@@ -98,7 +105,7 @@ export class MetadataService {
       ...current,
       ...patch,
       // 数组字段：patch 中明确传入才替换，否则保持原值
-      tags: patch.tags ?? current.tags,
+      bookmarks: patch.bookmarks ?? current.bookmarks,
       boundNotes: patch.boundNotes ?? current.boundNotes,
       annotations: patch.annotations ?? current.annotations,
       updatedAt: new Date().toISOString(),
@@ -121,7 +128,7 @@ export class MetadataService {
     return {
       version: META_VERSION,
       file: path.basename(pdfRel),
-      tags: [],
+      bookmarks: [],
       lastPage: 0,
       boundNotes: [],
       annotations: [],
