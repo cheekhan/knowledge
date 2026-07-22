@@ -1,0 +1,103 @@
+name: Build & Release
+
+on:
+  push:
+    tags:
+      - 'v*'               # 推送 v1.0.0 等标签时触发构建发布
+  workflow_dispatch:        # 手动触发
+
+jobs:
+  # ── 类型检查 & 测试 ──────────────────────────
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: 'pnpm'
+
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm typecheck
+      - run: pnpm test
+
+  # ── macOS 构建 ───────────────────────────────
+  build-mac:
+    needs: check
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: 'pnpm'
+
+      - run: pnpm install --frozen-lockfile
+
+      # 从 GITHUB_REPOSITORY (owner/repo) 自动注入到 electron-builder.yml
+      - name: Inject repo info
+        run: |
+          OWNER=$(echo "$GITHUB_REPOSITORY" | cut -d'/' -f1)
+          REPO=$(echo "$GITHUB_REPOSITORY" | cut -d'/' -f2)
+          sed -i '' "s/owner: .*/owner: \"$OWNER\"/" electron-builder.yml
+          sed -i '' "s/repo: .*/repo: \"$REPO\"/" electron-builder.yml
+
+      - name: Build & Publish macOS
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CSC_IDENTITY_AUTO_DISCOVERY: false
+        run: pnpm electron-vite build && npx electron-builder --mac --publish always
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos-dmg
+          path: dist/*.dmg
+
+  # ── Windows 构建 ─────────────────────────────
+  build-win:
+    needs: check
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: 'pnpm'
+
+      - run: pnpm install --frozen-lockfile
+
+      # 从 GITHUB_REPOSITORY 自动注入 (PowerShell)
+      - name: Inject repo info
+        run: |
+          $parts = "$env:GITHUB_REPOSITORY" -split '/'
+          (Get-Content electron-builder.yml) -replace 'owner: .*', "owner: ""$($parts[0])""" -replace 'repo: .*', "repo: ""$($parts[1])""" | Set-Content electron-builder.yml
+
+      - name: Build & Publish Windows
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: pnpm electron-vite build && npx electron-builder --win --publish always
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-exe
+          path: dist/*.exe
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-zip
+          path: dist/*.zip
