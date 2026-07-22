@@ -1,0 +1,21 @@
+{
+  "version": 2,
+  "file": "example.pdf",
+  "tags": ["示例", "入门"],
+  "lastPage": 1,
+  "boundNotes": [
+    "pdfs/example/《example》笔记 1.md"
+  ],
+  "annotations": [
+    {
+      "id": "demo-001",
+      "page": 1,
+      "type": "rect",
+      "rect": { "x": 0.1, "y": 0.08, "w": 0.65, "h": 0.06 },
+      "color": "#FFD54F",
+      "comment": "KnowledgeBase 欢迎你！点击右侧\"关联笔记\"查看绑定笔记。",
+      "createdAt": "2026-07-22T00:00:00Z"
+    }
+  ],
+  "updatedAt": "2026-07-22T00:00:00Z"
+}

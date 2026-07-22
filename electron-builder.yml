@@ -1,0 +1,41 @@
+appId: com.knowledgebase.app
+productName: KnowledgeBase
+
+directories:
+  output: dist
+
+asarUnpack:
+  - "node_modules/better-sqlite3/**"
+
+# GitHub Releases 发布配置（electron-updater 从此检测更新）
+publish:
+  provider: github
+  owner: ""   # 替换为你的 GitHub 用户名
+  repo: ""    # 替换为仓库名
+
+mac:
+  category: public.app-category.productivity
+  target:
+    - target: dmg
+      arch:
+        - x64
+        - arm64
+  hardenedRuntime: true
+  entitlements: build/entitlements.mac.plist
+  entitlementsInherit: build/entitlements.mac.plist
+
+win:
+  target:
+    - target: nsis
+      arch:
+        - x64
+    - target: zip
+      arch:
+        - x64
+
+nsis:
+  oneClick: false
+  allowToChangeInstallationDirectory: true
+
+# 构建时自动递增版本号（从 package.json 读取）
+# 每次发布前手动 bump version
