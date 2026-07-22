@@ -9,7 +9,7 @@
  * - Canvas devicePixelRatio 适配
  */
 
-import React, { useEffect, useRef, useState, useCallback } from 'react'
+import React, { useEffect, useRef, useState, useCallback, useMemo } from 'react'
 import { useWorkspaceStore } from '../../stores/workspace.store'
 import { usePdfStore } from '../../stores/pdf.store'
 import { pdfService } from '../../services/pdf.service'
@@ -24,8 +24,9 @@ import BookmarkPanel from './BookmarkPanel'
 import BoundNotesPanel from './BoundNotesPanel'
 import CreateNoteDialog from './CreateNoteDialog'
 import PdfFindBar from './PdfFindBar'
-import type { PdfEngine } from './engine/PdfEngine'
+import type { PdfEngine, PageDimension } from './engine/PdfEngine'
 import type { Annotation } from '../../../shared/types'
+import { PDF_MAX_CANVAS_PIXELS, PDF_RENDER_CONCURRENCY } from '../../../shared/constants'
 
 const PAGE_GAP = 16
 
@@ -39,7 +40,7 @@ const PdfViewer: React.FC = () => {
   const openSplit = useWorkspaceStore((s) => s.openSplit)
   const engineRef = useRef<PdfEngine | null>(null)
   const cacheRef = useRef(new PageCache())
-  const renderQueueRef = useRef(new PdfRenderQueue(2))
+  const renderQueueRef = useRef(new PdfRenderQueue(PDF_RENDER_CONCURRENCY))
   const scrollRef = useRef<HTMLDivElement>(null)
   /** 用户主动跳页标记 */
   const userJumpRef = useRef(false)
@@ -57,7 +58,7 @@ const PdfViewer: React.FC = () => {
   const targetPageRef = useRef(1)
 
   // ── 懒加载尺寸 Hook ───────────────────────
-  const { dims, ensureDim, estimateHeight, preloadRange } = usePageDimensions(
+  const { dims, ensureDim, estimateHeight, preloadRange, preloadAll } = usePageDimensions(
     engineRef.current,
     pageCount,
     targetPageRef.current
@@ -173,8 +174,10 @@ const PdfViewer: React.FC = () => {
         }
       }
 
-      // Stage C（后台）：懒加载可见范围尺寸
-      preloadRange(1, Math.min(count, 10))
+      // Stage C（后台）：先预载前段尺寸让首屏布局精确，
+      // 再用空闲时间渐进加载全部尺寸，避免页面尺寸不一导致虚拟滚动错算可见范围
+      preloadRange(1, Math.min(count, 20))
+      preloadAll(1, count)
     })()
 
     return () => {
@@ -349,35 +352,24 @@ const PdfViewer: React.FC = () => {
                     alignItems: 'flex-start'
                   }}
                 >
-                  {dim ? (
-                    <PageCanvas
-                      pageNum={pageNum}
-                      engine={engineRef.current}
-                      cache={cacheRef.current}
-                      renderQueue={renderQueueRef.current}
-                      scale={pdf.scale}
-                      pageWidth={Math.ceil(dim.width * pdf.scale)}
-                      pageHeight={pageHeight}
-                      priority={
-                        pageNum === page
-                          ? RenderPriority.Current
-                          : Math.abs(pageNum - page) === 1
-                            ? RenderPriority.Adjacent
-                            : RenderPriority.Visible
-                      }
-                    />
-                  ) : (
-                    /* 尺寸未就绪 → 灰色骨架占位 */
-                    <div
-                      style={{
-                        width: '70%',
-                        height: pageHeight,
-                        backgroundColor: 'var(--bg-tertiary)',
-                        borderRadius: 2,
-                        opacity: 0.3
-                      }}
-                    />
-                  )}
+                  {/* 始终挂载 PageCanvas：尺寸未就绪时由组件自行加载并渲染，
+                      不再因尺寸缺失而长期停留在骨架/白屏 */}
+                  <PageCanvas
+                    pageNum={pageNum}
+                    engine={engineRef.current}
+                    cache={cacheRef.current}
+                    renderQueue={renderQueueRef.current}
+                    ensureDim={ensureDim}
+                    dim={dim}
+                    scale={pdf.scale}
+                    priority={
+                      pageNum === page
+                        ? RenderPriority.Current
+                        : Math.abs(pageNum - page) === 1
+                          ? RenderPriority.Adjacent
+                          : RenderPriority.Visible
+                    }
+                  />
                 </div>
               )
             })}
@@ -490,78 +482,95 @@ const PdfViewer: React.FC = () => {
   )
 }
 
-// ── 单页 Canvas 组件（使用渲染队列 + devicePixelRatio 适配） ─────
+// ── 单页 Canvas 组件（自取尺寸 + 渲染队列 + devicePixelRatio 适配） ─────
 
 const PageCanvas: React.FC<{
   pageNum: number
   engine: PdfEngine | null
   cache: PageCache
   renderQueue: PdfRenderQueue
+  /** 按需加载本页尺寸（带并发上限与去重） */
+  ensureDim: (pageNum: number) => Promise<PageDimension>
+  /** 父级已解析的尺寸（可能为空，为空时组件自行加载） */
+  dim: PageDimension | null
   scale: number
-  pageWidth: number
-  pageHeight: number
   priority: number
 }> = React.memo(
-  ({ pageNum, engine, cache, renderQueue, scale, pageWidth, pageHeight, priority }) => {
+  ({ pageNum, engine, cache, renderQueue, ensureDim, dim, scale, priority }) => {
     const canvasRef = useRef<HTMLCanvasElement>(null)
     const renderedKeyRef = useRef(0) // 用于判断是否需要重渲染
+    /** 本组件解析到的尺寸（优先用父级已解析的） */
+    const [localDim, setLocalDim] = useState<PageDimension | null>(dim)
+
+    // 尺寸未就绪时自行加载（保证可见页一定能渲染，不会卡在白屏）
+    useEffect(() => {
+      if (dim) {
+        setLocalDim(dim)
+        return
+      }
+      let cancelled = false
+      ensureDim(pageNum)
+        .then((d) => {
+          if (!cancelled) setLocalDim(d)
+        })
+        .catch(() => {})
+      return () => {
+        cancelled = true
+      }
+    }, [dim, pageNum, ensureDim])
+
+    const effectiveDim = localDim ?? dim
+
+    // DPR 适配 + 单页像素上限保护（避免大页/高缩放时显存爆炸）
+    const renderScale = useMemo(() => {
+      const dpr = Math.min(window.devicePixelRatio || 1, 2)
+      let rs = scale * dpr
+      if (effectiveDim) {
+        const px = effectiveDim.width * effectiveDim.height * rs * rs
+        if (px > PDF_MAX_CANVAS_PIXELS) {
+          rs = Math.sqrt(PDF_MAX_CANVAS_PIXELS / (effectiveDim.width * effectiveDim.height))
+        }
+      }
+      return rs
+    }, [scale, effectiveDim])
 
     useEffect(() => {
-      if (!engine || !canvasRef.current) return
-
       const canvas = canvasRef.current
-      const renderKey = scale * 1000 + pageNum
+      if (!engine || !canvas || !effectiveDim) return
+
+      const cw = Math.ceil(effectiveDim.width * scale)
+      const ch = Math.ceil(effectiveDim.height * scale)
+      // renderKey：同 scale+pageNum 视为同一渲染结果
+      const renderKey = Math.round(scale * 1000) + pageNum
+
+      // 已有同结果缓存 → 从离屏副本快速恢复（不重新渲染）
       if (renderedKeyRef.current === renderKey) {
-        // 同 scale+pageNum 已有缓存 → 快速恢复
         const cached = cache.get(pageNum)
-        if (cached && cached !== canvas) {
+        if (cached) {
+          canvas.width = cached.width
+          canvas.height = cached.height
+          canvas.style.width = `${cw}px`
+          canvas.style.height = `${ch}px`
           const ctx = canvas.getContext('2d')
-          if (ctx) {
-            canvas.width = cached.width
-            canvas.height = cached.height
-            ctx.drawImage(cached, 0, 0)
-          }
+          if (ctx) ctx.drawImage(cached, 0, 0)
+          return
         }
-        return
       }
 
       let cancelled = false
-
       renderQueue.enqueue(pageNum, priority, async () => {
         if (cancelled) return
         const result = await engine.getPage(pageNum).catch(() => null)
         if (cancelled || !result) return
 
-        const dpr = Math.min(window.devicePixelRatio || 1, 2)
-        const scaledW = Math.floor(pageWidth * dpr)
-        const scaledH = Math.floor(pageHeight * dpr)
-
-        // 单页像素上限保护
-        if (scaledW * scaledH > 16_000_000) {
-          // 超出上限，降 DPR
-          const safeDpr = Math.sqrt(16_000_000 / (pageWidth * pageHeight))
-          const safeW = Math.floor(pageWidth * safeDpr)
-          const safeH = Math.floor(pageHeight * safeDpr)
-          canvas.width = safeW
-          canvas.height = safeH
-          canvas.style.width = `${pageWidth}px`
-          canvas.style.height = `${pageHeight}px`
-          await result.renderTo(canvas, scale * safeDpr)
-        } else {
-          canvas.width = Math.floor(pageWidth * dpr)
-          canvas.height = Math.floor(pageHeight * dpr)
-          canvas.style.width = `${pageWidth}px`
-          canvas.style.height = `${pageHeight}px`
-          // 用物理像素渲染：scale * dpr 确保高 DPI 屏清晰
-          const tempCanvas = document.createElement('canvas')
-          await result.renderTo(tempCanvas, scale * dpr)
-          canvas.width = tempCanvas.width
-          canvas.height = tempCanvas.height
-          canvas.style.width = `${Math.floor(tempCanvas.width / dpr)}px`
-          canvas.style.height = `${Math.floor(tempCanvas.height / dpr)}px`
-          const ctx2 = canvas.getContext('2d')
-          if (ctx2) ctx2.drawImage(tempCanvas, 0, 0)
-        }
+        const w = Math.floor(effectiveDim.width * renderScale)
+        const h = Math.floor(effectiveDim.height * renderScale)
+        canvas.width = w
+        canvas.height = h
+        canvas.style.width = `${cw}px`
+        canvas.style.height = `${ch}px`
+        // 直接渲染到显示 canvas（renderTo 内部按 renderScale 设置视口）
+        await result.renderTo(canvas, renderScale)
 
         if (!cancelled) {
           cache.set(pageNum, canvas)
@@ -573,16 +582,37 @@ const PageCanvas: React.FC<{
         cancelled = true
         renderQueue.cancel(pageNum)
       }
-    }, [engine, pageNum, scale, pageWidth, pageHeight, priority, cache, renderQueue])
+      // 注意：priority 不在此依赖中，避免滚动时优先级变化反复取消渲染 → 白屏
+    }, [engine, pageNum, scale, renderScale, effectiveDim, cache, renderQueue])
 
+    // 滚动导致优先级变化时，仅更新队列顺序，不打断进行中的渲染
+    useEffect(() => {
+      renderQueue.updatePriority(pageNum, priority)
+    }, [priority, pageNum, renderQueue])
+
+    // 尺寸未就绪 → 骨架占位（极短，加载完即渲染）
+    if (!effectiveDim) {
+      return (
+        <div
+          style={{
+            width: '70%',
+            height: '80%',
+            backgroundColor: 'var(--bg-tertiary)',
+            borderRadius: 2,
+            opacity: 0.3
+          }}
+        />
+      )
+    }
+
+    const cw = Math.ceil(effectiveDim.width * scale)
+    const ch = Math.ceil(effectiveDim.height * scale)
     return (
       <canvas
         ref={canvasRef}
-        width={pageWidth}
-        height={pageHeight}
         style={{
-          width: `${pageWidth}px`,
-          height: `${pageHeight}px`,
+          width: `${cw}px`,
+          height: `${ch}px`,
           boxShadow: '0 1px 6px rgba(0,0,0,0.1)',
           borderRadius: 2
         }}

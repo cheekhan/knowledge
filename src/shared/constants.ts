@@ -68,6 +68,12 @@ export const PDF_VISIBLE_BUFFER = 2
 /** 单页 canvas 像素上限（16 megapixels），超出自动降低 devicePixelRatio */
 export const PDF_MAX_CANVAS_PIXELS = 16_000_000
 
+/** 渲染缓存总像素预算（200 megapixels）：离屏副本总占用上限，超出淘汰最久未用页 */
+export const PDF_MAX_CACHE_PIXELS = 200_000_000
+
+/** PDF 页面并行渲染数：提升可见页呈现速度，同时避免抢占主线程 */
+export const PDF_RENDER_CONCURRENCY = 3
+
 /** 自动保存防抖毫秒 */
 export const AUTO_SAVE_DEBOUNCE_MS = 1000
 
